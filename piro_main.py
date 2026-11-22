@@ -188,32 +188,22 @@ def apply_config(guild_id: int) -> None:
 # BOT
 # ----------------------------------------------------------------------------
 DIV_LB_COMMANDS = {f"leaderboarddivision{d}" for d in range(1, 6)}
-OWNER_ONLY_COMMANDS = {"trust", "backup", "restore"}
-PUBLIC_COMMANDS = {"div-assists", "my-rank", "ping"}
+ANYWHERE_COMMANDS = {"ping", "sync", "help"}   # these also work in other servers and in DMs
 
 
 class GuardedTree(app_commands.CommandTree):
+    """Every command can be used by everyone. The only rule: commands that read or write the saved raids work
+    in the configured server (GUILD_ID); the 5 division leaderboards, /ping, /sync and /help work anywhere."""
+
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        _cmd = interaction.command
-        _root = _cmd.root_parent.name if _cmd is not None and _cmd.root_parent else getattr(_cmd, "name", "")
-        if _root in DIV_LB_COMMANDS:  # the 5 division leaderboards: anyone, in any server or DM
+        cmd = interaction.command
+        root = cmd.root_parent.name if cmd is not None and cmd.root_parent else getattr(cmd, "name", "")
+        if root in DIV_LB_COMMANDS or root in ANYWHERE_COMMANDS:
             return True
         if not GUILD_ID or interaction.guild_id != GUILD_ID:
             raise app_commands.CheckFailure("wrong_server")
-        if interaction.guild_id:
-            apply_config(interaction.guild_id)
-        uid = interaction.user.id
-        if isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.manage_guild:
-            return True
-        if uid == OWNER_ID:
-            return True
-        command = interaction.command
-        root = command.root_parent.name if command is not None and command.root_parent else getattr(command, "name", "")
-        if root in PUBLIC_COMMANDS:
-            return True
-        if root not in OWNER_ONLY_COMMANDS and is_trusted(uid):
-            return True
-        raise app_commands.CheckFailure("not allowed")
+        apply_config(interaction.guild_id)
+        return True
 
 
 intents = discord.Intents.default()
@@ -3906,7 +3896,7 @@ async def _before_hourly_backup():
 # SETUP (/setup + when the bot joins a server)
 # ----------------------------------------------------------------------------
 def can_setup(user) -> bool:
-    return user.id == OWNER_ID or (isinstance(user, discord.Member) and user.guild_permissions.manage_guild)
+    return True      # every command and its buttons can be used by everyone
 
 
 def setup_embed(guild: discord.Guild) -> discord.Embed:
@@ -4329,12 +4319,12 @@ async def on_raw_message_edit(payload: discord.RawMessageUpdateEvent):
 # ----------------------------------------------------------------------------
 
 
-# SLASH COMMANDS: TRUST + SETUP (owner only)
+# SLASH COMMANDS: TRUST + SETUP (everyone)
 # ----------------------------------------------------------------------------
 trust_group = app_commands.Group(name="trust", description="Choose who may use the bot's commands", guild_only=True)
 
 
-@trust_group.command(name="add", description="Allow a user to use the bot's commands")
+@trust_group.command(name="add", description="Add a user to the trusted list (everyone can use every command now)")
 @app_commands.describe(user="User to trust")
 async def trust_add(interaction: discord.Interaction, user: discord.User):
     if user.bot or user.id == OWNER_ID:
@@ -4370,7 +4360,7 @@ async def trust_list(interaction: discord.Interaction):
 bot.tree.add_command(trust_group)
 
 
-@bot.tree.command(name="setup", description="Owner only: auto build the channels or choose your own")
+@bot.tree.command(name="setup", description="Auto build the channels or choose your own")
 @app_commands.guild_only()
 async def setup_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=setup_embed(interaction.guild), view=SetupView(), ephemeral=True)
@@ -4403,10 +4393,11 @@ async def help_command(interaction: discord.Interaction):
         "`/deleteraid` - remove a raid and its log\n"
         "`/preview` - preview scoring from typed counts\n"
         "`/status` - configuration and totals"))
-    embed.add_field(name="Owner only", inline=False, value=(
+    embed.add_field(name="Setup, backups and trust", inline=False, value=(
         "`/setup` - auto build the channels or choose your own\n"
-        "`/trust add` `/trust remove` `/trust list` - choose who can use these commands\n"
-        "`/backup` - DM yourself a database backup now (one is also sent every hour)\n"
+        "`/trust add` `/trust remove` `/trust list` - keep a trusted list (everyone can use every command now)\n"
+        "`/sync` - re-sync the slash commands so they show up\n"
+        "`/backup` - DM the owner a database backup now (one is also sent every hour)\n"
         "`/restore` - restore the database from a backup `.sqlite3` file\n"
         "**Edit** button on a division log - add or remove raiders"))
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -4697,7 +4688,6 @@ async def recount_command(interaction: discord.Interaction, number: int | None =
 
 @bot.tree.command(name="rebuild", description="Rebuild MVP scores from the configured MVP channel history")
 @app_commands.guild_only()
-@app_commands.checks.has_permissions(manage_guild=True)
 async def rebuild_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     scanned = saved = skipped = inaccessible = 0
@@ -4790,21 +4780,18 @@ async def preview_command(interaction: discord.Interaction, d1: app_commands.Ran
         ephemeral=True)
 
 
-@bot.tree.command(name="backup", description="Owner only: send a database backup to your DMs now")
+@bot.tree.command(name="backup", description="Send a database backup to the owner's DMs now")
 async def backup_command(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True, thinking=True)
     text = await send_backup_dm("manual")
     await interaction.followup.send(embed=make_embed("Backup", text, 0x57F287), ephemeral=True)
 
 
-@bot.tree.command(name="restore", description="Owner only: restore the database from a backup .sqlite3 file")
+@bot.tree.command(name="restore", description="Restore the database from a backup .sqlite3 file")
 @app_commands.describe(file="A urdiv_*.sqlite3 backup file from your DMs")
 @app_commands.guild_only()
 async def restore_command(interaction: discord.Interaction, file: discord.Attachment):
     await interaction.response.defer(ephemeral=True, thinking=True)
-    if interaction.user.id != OWNER_ID:
-        await interaction.followup.send("Only the owner can restore a backup.", ephemeral=True)
-        return
     if file.size > 25 * 1024 * 1024 or not file.filename.lower().endswith((".sqlite3", ".sqlite", ".db")):
         await interaction.followup.send(embed=make_embed(
             "Restore", "Attach a `.sqlite3` backup file (under 25 MB).", 0xED4245), ephemeral=True)
@@ -4860,10 +4847,39 @@ async def ping_command(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed)
 
 
+SYNC_LAST = 0.0
+
+
+@bot.tree.command(name="sync", description="Re-sync the bot's slash commands so they show up")
+async def sync_command(interaction: discord.Interaction):
+    global SYNC_LAST
+    if time.time() - SYNC_LAST < 60:
+        await interaction.response.send_message("The commands were synced a moment ago. Try again in a minute.", ephemeral=True)
+        return
+    SYNC_LAST = time.time()
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    lines = []
+    try:
+        synced = await bot.tree.sync()
+        lines.append(f"Slash commands synced: **{len(synced)}**")
+    except Exception as exc:
+        lines.append(f"Sync failed: `{exc!r}`")
+    if interaction.guild is not None:
+        try:
+            await bot.tree.sync(guild=discord.Object(id=interaction.guild.id))   # clears old server-only copies
+            lines.append("Old server-only copies cleared.")
+        except Exception as exc:
+            lines.append(f"Could not clear old copies: `{exc!r}`")
+    lines.append("If a command is still missing, reload Discord (Ctrl+R) or wait a few minutes.")
+    await interaction.followup.send(embed=make_embed("Sync", "\n".join(lines), 0x57F287), ephemeral=True)
+
+
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure) and str(error) == "wrong_server":
-        embed = make_embed("Wrong server", "This bot is set up for the URA server only.", 0xED4245)
+        embed = make_embed("Wrong server", f"This bot's raid data is set up for one server (ID `{GUILD_ID}`). "
+                           "If this is the right server, set GUILD_ID to this server's ID in the host's environment variables.",
+                           0xED4245)
     elif isinstance(error, app_commands.CheckFailure):
         embed = make_embed("Not allowed", "Only the owner and trusted users can use this command.", 0xED4245)
     else:
@@ -4988,15 +5004,8 @@ for _d in range(1, 6):
 # ----------------------------------------------------------------------------
 
 
-# The 5 division leaderboards are GLOBAL commands (anyone, any server or DM). Every other command is
-# registered for the URA server only, so they never show up in other servers.
-if GUILD_ID:
-    _home = discord.Object(id=GUILD_ID)
-    for _cmd in list(bot.tree.get_commands()):
-        if _cmd.name in DIV_LB_COMMANDS:
-            continue
-        bot.tree.remove_command(_cmd.name)
-        bot.tree.add_command(_cmd, guild=_home)
+# Every command is GLOBAL, so it shows up in every server the bot is in. Commands that use the saved raid data still
+# only run in the configured server (see GuardedTree above). On start-up the old server-only copies are cleared.
 
 # START
 # ----------------------------------------------------------------------------
@@ -5004,6 +5013,3 @@ if not TOKEN or TOKEN == "PASTE_YOUR_BOT_TOKEN_HERE":
     raise RuntimeError("Set your Discord bot token in .env before starting the bot.")
 cloud_restore_sync()          # restore from Supabase first if the local file is empty (Render wipes it on restart)
 bot.run(TOKEN)
-
-
-
